@@ -1,13 +1,13 @@
-"""cbBTC bar-replay bot v2 (agent-fun/bars-replay/v1), Python 3.13 stdlib only.
+"""cbBTC bar-replay bot v3 (agent-fun/bars-replay/v1), Python 3.13 stdlib only.
 
-Design: staged mean reversion with a two-step take-profit.
+Design: staged mean reversion with a two-step take-profit, a deeper final
+target for two-tranche positions, and one re-entry after a banked exit.
 
 The dev window's 1-minute bars revert after sharp drops under a slow mean,
 but a round trip here is expensive (4 bps fee, 2 bps slippage, plus
 constant-product impact against each bar's pool depth), so the bot only
-trades deep, decelerating dips, commits real size when it does, and then
-banks the recovery in two steps instead of betting the whole position on
-one exit price:
+trades deep, decelerating dips, commits real size when it does, and banks
+the recovery in steps:
 
   - Anchor: EMA of the last 300 closes; deviation = close vs anchor, in bps.
   - Entry: deviation <= -40 bps while the last 15 bars are not in freefall
@@ -15,7 +15,13 @@ one exit price:
   - Add-on: one extra tranche of 40% of equity if the deviation deepens to
     -70 bps; never more than these two tranches.
   - Take-profit, step 1: at deviation >= +10 bps, sell half the position.
-  - Take-profit, step 2: the rest goes at deviation >= +35 bps.
+  - Take-profit, step 2: the rest goes at deviation >= +35 bps — or at
+    +45 bps when the position holds both tranches: a dip deep enough to
+    trigger the add-on has further to recover, and the extra room is worth
+    more than the earlier exit.
+  - Re-entry: once step 1 has banked, if the price sinks back to -40 bps
+    while the second half is still held, buy back in once with 30% of
+    equity — the same dip, sold twice.
   - Risk exits, either step: a hard stop 90 bps under the average entry
     price, or 420 bars held, sells whatever remains.
   - Five quiet bars after every exit; no fresh entries in the last 20 bars
@@ -42,6 +48,8 @@ FIRST_SHARE = 0.55       # first tranche, share of equity
 ADDON_SHARE = 0.40       # add-on tranche, share of equity
 BANK_BPS = 10.0          # take-profit step 1: sell half at this deviation
 DONE_BPS = 35.0          # take-profit step 2: sell the rest here
+DONE_DEEP_BPS = 45.0     # step 2 when both tranches are in: let it run
+REENTRY_SHARE = 0.30     # one rebuy after banking, share of equity
 STOP_BPS = 90.0          # hard stop under the average entry price
 TIME_STOP = 420          # bars
 REST_BARS = 5            # cooldown after an exit
@@ -62,6 +70,8 @@ class StagedReversion:
         self.avg_entry = 0.0           # average fill price (raw price units)
         self.opened_seq = -1
         self.banked = False            # take-profit step 1 already taken
+        self.reentered = False         # the one post-bank rebuy already used
+        self.expect_reentry = False    # a rebuy order is in flight
         self.awaiting = 0              # batches to let an order land
         self.rest = 0                  # cooldown batches left
 
@@ -86,7 +96,7 @@ class StagedReversion:
                            "max_slippage_bps": SLIP_CAP})
 
     # -- bookkeeping ------------------------------------------------------
-    def _sync_position(self, state, dev_bps):
+    def _sync_position(self, state):
         """Fold the account's position into our stage counter; fills are
         recognised by the booked cost/quantity changing between batches."""
         pos = state.positions.get(SYMBOL)
@@ -96,8 +106,13 @@ class StagedReversion:
                 self.stage = 1
                 self.opened_seq = state.seq
                 self.banked = False
+                self.reentered = False
             elif pos.qty > self.book_qty:
-                self.stage = 2         # the add-on landed
+                if self.expect_reentry:
+                    # the rebuy landed: same stage, not an add-on
+                    self.expect_reentry = False
+                else:
+                    self.stage = 2     # the add-on landed
             self.avg_entry = pos.cost * 10**7 / pos.qty
             self.book_cost = pos.cost
             self.book_qty = pos.qty
@@ -121,7 +136,7 @@ class StagedReversion:
             self.mean += (2.0 / (ANCHOR_SPAN + 1)) * (price - self.mean)
         dev_bps = (price / self.mean - 1.0) * 10000.0
 
-        held = self._sync_position(state, dev_bps)
+        held = self._sync_position(state)
 
         if self.awaiting:
             # an order decided last batch fills at this bar's open; give the
@@ -136,11 +151,14 @@ class StagedReversion:
 
         if held:
             pos = state.positions[SYMBOL]
+            # a two-tranche position entered on a deeper dip: its recovery
+            # has further to travel, so the final exit waits for +45 bps
+            done_bps = DONE_DEEP_BPS if self.stage == 2 else DONE_BPS
             if not self.banked and dev_bps >= BANK_BPS:
                 # recovery reached: bank half, let the rest ride to step 2
                 self.banked = True
                 return self._sell(max(1, pos.qty // 2))
-            if self.banked and dev_bps >= DONE_BPS:
+            if self.banked and dev_bps >= done_bps:
                 return self._sell(pos.qty)
             if price <= self.avg_entry * (1.0 - STOP_BPS / 10000.0):
                 return self._sell(pos.qty)
@@ -148,6 +166,12 @@ class StagedReversion:
                 return self._sell(pos.qty)
             if self.stage == 1 and dev_bps <= DEEPER_BPS:
                 return self._buy(state, ADDON_SHARE)
+            if self.banked and not self.reentered and dev_bps <= DIP_BPS:
+                # banked half, price sank back to the entry dip: buy back
+                # in once and sell the same recovery a second time
+                self.reentered = True
+                self.expect_reentry = True
+                return self._buy(state, REENTRY_SHARE)
             return None
 
         if self.rest:
